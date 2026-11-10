@@ -7,10 +7,17 @@ On Friday 6th November, I had an opportunity to visit the Mini Hackathon by Opti
 The hackathon took place for around 5 hours of testing time and one final evaluation round, during which the winner was estimated. During the preparation round, we were testing dfferent stratagies and ideas. We were trading a universe of 6 Tech stocks (no options, etfs or futures), although it is not the fundamentals that mattered behind (as prices were not a representation of a real market price), but the patterns and behaviour of other participants. The teams of 3-4 members were formed and given access to a cloud kernel to run the research and ideas using Optibook. (You can find any further information online, as I did before the competition, difference is, every challenge differes in its structure and limitations)
 
 # Elaboration on the final model of my team
-Before the challenge I have drafted a [template version](https://github.com/mathio3434/ETH-MiniHack-Nov26/blob/main/template) of the market making bot using a basics from [Marco Avellaneda & Sasha Stoikov](https://people.orie.cornell.edu/sfs33/LimitOrderBook.pdf), introducing a risk-aversion and sensitivity parameters to control for the reservation price and volatility spreads. Additionally, I have implemented the order imbalance to control for the storage & adjust the quoting (Shall I build a positive inventory - I would quote asks closer to my reservation price). Volatility spreads were build using the Half-life EWMA to ensure a reactive reaction to the sudden volatility changes (my favourite metric for the short horizon volatility meassurement).
+Before the challenge I have drafted a [template version](https://github.com/mathio3434/ETH-MiniHack-Nov26/blob/main/template) of the market making bot using a basics from [Marco Avellaneda & Sasha Stoikov](https://people.orie.cornell.edu/sfs33/LimitOrderBook.pdf), introducing a risk-aversion and sensitivity parameters to control for the reservation price and volatility spreads. Additionally, I have implemented the order imbalance to control for the storage & adjust the quoting (Shall I build a positive inventory - I would quote asks closer to my reservation price). Volatility spreads were build using the Half-life EWMA to ensure a reactive reaction to the sudden volatility changes (my favourite metric for the short horizon volatility measurement). Most important part is of course limits on different sides, many implemented as of a mechanic nature (Ex. out bid cannot be higher than our ask, or our bid cannot be lower than specific "untraded" bound), and as of the controlling (Ex. sigma multiplier or order imbalance).
 
-\n Equation to define BID / ASK:
-$$P_{Bid} = $$
+**Equation to define BID / ASK**:
+
+$$P_{Bid} = MP + OI - INVST - 1/2(HF+VA)$$
+
+$$P_{Ask} = MP + OI - INVST + 1/2max(HF+VA,mHA)$$
+
+where: MP - Micro Price, OI - Order Book Imbalance, INVST - Inventory Shift (tanh limit [-1,1]), HF - Half Spread, VA - Volatility Adjustment. For simplicity I have left out all the limits and specific formulas you can find them in: [template version](https://github.com/mathio3434/ETH-MiniHack-Nov26/blob/main/template). Additionally, the model carries a robust, conservative infrastructure for order handling, by ensuring to hold all the limits, clean outstanding orders, shall the other user connect, manual hand break option and clear order management. One of the pronounced tradeoffs is that if additional orders are possible, the order is first deleted before the new one is inserted. Shall we break on exchange call limits, it can result into the price/time slippage. However, the code ensures the order placing up to the wished magnitude, conditional on outstanding free limits incl. possible fill of all orders. Since the infrastructure is rather general (except for limits) I do not see any comparative advantage of the model, unless calibrated for the specific markets, leaving it a central role of being educative.
+
+
 
 
 
