@@ -17,38 +17,39 @@ log = logging.getLogger("MM")
 # ============================== CONFIG ==============================
 INSTRUMENTS = ["NVDA",....]
 
-POS_LIMIT = 100                   # max |position| per instrument
+# --- limits ---
+POS_LIMIT = 100                   # max position per instrument
 MAX_ORDERS_OUT = 200              # max outstanding orders per instrument
-RATE_CAP = 20                     # our cap on order actions/s (guide: exchange hard limit 25)
-READS_COUNT_TOWARD_LIMIT = False  # guide: the 25/s counts inserts/deletes/amends only
+RATE_CAP = 20                     # our cap on order actions (hard limit 25)
+READS_COUNT_TOWARD_LIMIT = False  # False: the 25/s counts inserts/deletes/amends only; True: Exchange Position Calls
 
 SOFT_POS_LIMIT = 80               # stop quoting the side that adds inventory beyond this
-BASELINE = 0                      # inventory the skew pulls toward (0 = pure market making) == Sof tpos limit - turn off
-QUOTE_VOL = 5                     # lots per quote???
-MAX_SKEW_TICKS = 5                # centre shift in ticks at the soft limit (PLACEHOLDER)
-SKEW_BETA = 2.0                   # tanh steepness (PLACEHOLDER)
+BASELINE = 0                      # inventory the skew pulls toward (0 = pure market making)
+QUOTE_VOL = 5                     # volume per quote
+MAX_SKEW_TICKS = 5                # centre shift in ticks at the soft limit
+SKEW_BETA = 2.0                   # tanh steepness
 
 # --- spread model ---
-HALF_SPREAD_MULT = 1.0            # our base half spread = this x measured market half spread
-MIN_HALF_TICKS = 1.5              # floor on our half width, in ticks
+HALF_SPREAD_MULT = 1.0            # base half spread = this x measured market half spread
+MIN_HALF_TICKS = 1.5              # floor on half width, in ticks
 VOL_MULT = 1.0                    # extra half width per 1 sigma of recent microprice moves
-MAX_DEV_MULT = 4.0                # guard: quotes stay within this x market half spread of micro
+MAX_DEV_MULT = 4.0                # quotes stay within this x market half spread of micro
 SPREAD_HALFLIFE = 40              # loops, EWMA of the market spread
 VOL_HALFLIFE = 10                 # loops, EWMA of squared microprice changes
 
 # --- depth imbalance (OFF until the logged imb column shows it predicts the next move) ---
 IMB_MAX_TICKS = 0.0               # max centre shift in ticks. 0 = disabled
-IMB_LEVELS = 3                    # how much bids/ask we go down in a bok to assess imbalance
+IMB_LEVELS = 3                    # how much bids/ask we go down in a book to assess imbalance
 
 # --- order management ---
-NEAR_TICKS = 3                    # our same-side orders within this many ticks get replaced
+NEAR_TICKS = 3                    # same-side orders within this many ticks get replaced
 LOOP_HZ = 4
 
 # --- kill switch ---
 STOP_FILE = "STOP"                # create this file in the working directory to stop the bot
 STALE_CANCEL_LOOPS = 8            # loops without good data -> pull this instrument's quotes
-MAX_BAD_LOOPS = 40                # loops without good data -> kill everything (PLACEHOLDER)
-MAX_DRAWDOWN = 1000.0             # kill if PnL falls this far below its peak (PLACEHOLDER)
+MAX_BAD_LOOPS = 40                # loops without good data -> kill everything
+MAX_DRAWDOWN = 1000.0             # kill if PnL falls this far below its peak
 MAX_RECONNECTS = 3                # a limit breach disconnects us; don't loop on it forever
 
 EPS = 1e-9                        # float tolerance for price comparisons
@@ -125,7 +126,7 @@ class MarketMaker:
         self.limiter = RateLimiter(RATE_CAP)
         self.vols = defaultdict(lambda: Vol(VOL_HALFLIFE))
         self.spreads = defaultdict(lambda: Ewma(SPREAD_HALFLIFE))
-        self.ticks = {}                       # instrument_id -> tick size, read from the exchange
+        self.ticks = {}
         self.last_pos = {}
         self.bad_loops = defaultdict(int)
         self.pnl = None
@@ -211,7 +212,7 @@ class MarketMaker:
 
     def quote_prices(self, micro, pos, sigma, imb, mkt_half, best_bid, best_ask, tick):
         half = max(HALF_SPREAD_MULT * mkt_half + VOL_MULT * sigma, MIN_HALF_TICKS * tick)
-        centre = micro + IMB_MAX_TICKS * tick * imb - self.inventory_shift(pos, tick) # look into the roel of imb???-> switch max ticks
+        centre = micro + IMB_MAX_TICKS * tick * imb - self.inventory_shift(pos, tick) # look into the role of imb???-> switch max ticks
 
         # guard 1: stay in a band around the theoretical price
         max_dev = max(MAX_DEV_MULT * mkt_half, 2 * tick)
@@ -219,7 +220,7 @@ class MarketMaker:
         raw_bid = min(max(centre - half, low), high)
         raw_ask = min(max(centre + half, low), high)
 
-        # ???floor to the integer on ticks - 3.9 ceil 4, 3.1 floor 3
+        # floor to the integer on ticks - 3.9 ceil 4, 3.1 floor 3
         bid = round(math.floor(raw_bid / tick + EPS) * tick, 2)
         ask = round(math.ceil(raw_ask / tick - EPS) * tick, 2)
 
@@ -234,10 +235,6 @@ class MarketMaker:
 
     @staticmethod
     def quote_sizes(pos):
-        """Capping by the distance to the soft limit instead means the
-        position asymptotes to SOFT_POS_LIMIT whatever QUOTE_VOL is, and the
-        POS_LIMIT - SOFT_POS_LIMIT lots of headroom are always there to absorb
-        in-flight fills."""
         bid_vol = max(0, min(QUOTE_VOL, SOFT_POS_LIMIT - pos)) # positive position influences
         ask_vol = max(0, min(QUOTE_VOL, SOFT_POS_LIMIT + pos)) # negative position influences
         return bid_vol, ask_vol
@@ -255,7 +252,7 @@ class MarketMaker:
             return False
         self.limiter.hit()
         if not resp.success:
-            # keep it in the snapshot: assume it may still rest (conservative for limits)
+            # keep it in the snapshot: assume it may still rest
             log.warning(f"delete_order {iid} #{oid} failed: {resp.error_reason}")
             return False
         orders.pop(oid, None)
@@ -275,7 +272,7 @@ class MarketMaker:
                 return oid  # identical quote already resting: no requests, keeps queue spot
 
         near = [oid for oid, o in same_side.items() if abs(o.price - price) <= NEAR_TICKS * tick + EPS]
-        if not self.limiter.ok(len(near) + 1):  # all-or-nothing: never cancel without budget to re-insert
+        if not self.limiter.ok(len(near) + 1):  
             return RATE_LIMITED
         for oid in near:
             self._delete(iid, oid, orders)
@@ -287,11 +284,11 @@ class MarketMaker:
         rest_bids = sum(o.volume for o in orders.values() if o.side == "bid")
         rest_asks = sum(o.volume for o in orders.values() if o.side == "ask")
         if side == "bid":
-            room = POS_LIMIT - (pos + rest_bids)    # worst case: every bid fills
+            room = POS_LIMIT - (pos + rest_bids)
             best_opp = min((o.price for o in orders.values() if o.side == "ask"), default=None)
             crosses = best_opp is not None and price >= best_opp - EPS
         else:
-            room = POS_LIMIT + (pos - rest_asks)    # worst case: every ask fills
+            room = POS_LIMIT + (pos - rest_asks)
             best_opp = max((o.price for o in orders.values() if o.side == "bid"), default=None)
             crosses = best_opp is not None and price <= best_opp + EPS
         vol = min(vol, room)
@@ -346,7 +343,7 @@ class MarketMaker:
         best_bid, best_ask = book.bids[0].price, book.asks[0].price
         micro = self.microprice(book)
         imb = self.depth_imbalance(book)
-        sigma = self.vols[iid].update(micro)                       # the ONLY place vol advances
+        sigma = self.vols[iid].update(micro)
         mkt_half = self.spreads[iid].update((best_ask - best_bid) / 2)
 
         prev = self.last_pos.get(iid)
@@ -387,8 +384,8 @@ class MarketMaker:
             os.remove(STOP_FILE)
             log.info(f"removed leftover {STOP_FILE} file")
         for iid in iids:
-            self.cancel_all(iid)  # clean slate: no leftovers from a previous run
-        self.write_row(LOG_COLUMNS)  # header (Exporter puts a timestamp in column 1)
+            self.cancel_all(iid)  # no leftovers from a previous run
+        self.write_row(LOG_COLUMNS)
         log.info(f"Logging to exports/{LOG_FILE}")
 
     def kill_reason(self):
@@ -440,7 +437,7 @@ class MarketMaker:
         except Exception as ex:
             log.warning(f"final report failed: {ex}")
         try:
-            self.ex.disconnect()  # only one connection per username: free it for the next run
+            self.ex.disconnect()  
         except Exception as ex:
             log.warning(f"disconnect: {ex}")
 
@@ -455,8 +452,6 @@ class MarketMaker:
                     log.error(f"KILL SWITCH: {reason}")
                     break
                 if not self.ex.is_connected():
-                    # The guide: breaching a limit rejects the order AND disconnects us.
-                    # Reconnecting in a loop would just hide that, so cap the retries.
                     self.disconnects += 1
                     if self.disconnects > MAX_RECONNECTS:
                         log.error(f"KILL SWITCH: disconnected {self.disconnects}x "
