@@ -13,7 +13,7 @@ Before the challenge I have drafted a [template version](https://github.com/math
 
 $$P_{Bid} = MP + OI - INVST - 1/2(HF+VA)$$
 
-$$P_{Ask} = MP + OI - INVST + 1/2max(HF+VA,mHA)$$
+$$P_{Ask} = MP + OI - INVST + 1/2(HF+VA)$$
 
 where: MP - Micro Price, OI - Order Book Imbalance, INVST - Inventory Shift (tanh limit [-1,1]), HF - Half Spread, VA - Volatility Adjustment. For simplicity I have left out all the limits and specific formulas you can find them in: [template version](https://github.com/mathio3434/ETH-MiniHack-Nov26/blob/main/template). Additionally, the model carries a robust, conservative infrastructure for order handling, by ensuring to hold all the limits, clean outstanding orders, shall the other user connect, manual hand break option and clear order management. One of the pronounced tradeoffs is that if additional orders are possible, the order is first deleted before the new one is inserted. Shall we break on exchange call limits, it can result into the price/time slippage. However, the code ensures the order placing up to the wished magnitude, conditional on outstanding free limits incl. possible fill of all orders. Since the infrastructure is rather general (except for limits) I do not see any comparative advantage of the model, unless calibrated for the specific markets, leaving it a central role of being educative.
 
