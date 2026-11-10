@@ -1,14 +1,3 @@
-
-#Questions to ask / look up:
-# 1. if we have a rate limiter on calls such as pnl, orders oustanding, book, or only on managing orders
-# 2. Lots per quote
-#
-
-
-# Compute in sandbox:
-# 1. From your sandbox log, compute the per-update change in mid: what fraction are zero, how big are the non-zero ones,
-# how fat is the tail? -> assess liquidity book mb capp the vol spreads
-
 import logging
 import math
 import os
@@ -25,17 +14,14 @@ logging.getLogger("client").setLevel("ERROR")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("MM")
 
-
 # ============================== CONFIG ==============================
-INSTRUMENTS = ["AMD","AVGO","CRWV","MU","NBIS","NVDA","SNDK","VRT"]
+INSTRUMENTS = ["NVDA",....]
 
-# --- limits (from the FutureFocus 2026 guide; RE-CONFIRM in the ETH briefing) ---
 POS_LIMIT = 100                   # max |position| per instrument
 MAX_ORDERS_OUT = 200              # max outstanding orders per instrument
 RATE_CAP = 20                     # our cap on order actions/s (guide: exchange hard limit 25)
 READS_COUNT_TOWARD_LIMIT = False  # guide: the 25/s counts inserts/deletes/amends only
 
-# --- sizing / inventory ---
 SOFT_POS_LIMIT = 80               # stop quoting the side that adds inventory beyond this
 BASELINE = 0                      # inventory the skew pulls toward (0 = pure market making) == Sof tpos limit - turn off
 QUOTE_VOL = 5                     # lots per quote???
