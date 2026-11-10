@@ -1,0 +1,500 @@
+
+#Questions to ask / look up:
+# 1. if we have a rate limiter on calls such as pnl, orders oustanding, book, or only on managing orders
+# 2. Lots per quote
+#
+
+
+# Compute in sandbox:
+# 1. From your sandbox log, compute the per-update change in mid: what fraction are zero, how big are the non-zero ones,
+# how fat is the tail? -> assess liquidity book mb capp the vol spreads
+
+import logging
+import math
+import os
+import signal
+import time
+from collections import defaultdict, deque
+from datetime import datetime
+from types import SimpleNamespace
+
+from optibook.exporter import Exporter
+from optibook.synchronous_client import Exchange
+
+logging.getLogger("client").setLevel("ERROR")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("MM")
+
+
+# ============================== CONFIG ==============================
+INSTRUMENTS = ["AMD","AVGO","CRWV","MU","NBIS","NVDA","SNDK","VRT"]
+
+# --- limits (from the FutureFocus 2026 guide; RE-CONFIRM in the ETH briefing) ---
+POS_LIMIT = 100                   # max |position| per instrument
+MAX_ORDERS_OUT = 200              # max outstanding orders per instrument
+RATE_CAP = 20                     # our cap on order actions/s (guide: exchange hard limit 25)
+READS_COUNT_TOWARD_LIMIT = False  # guide: the 25/s counts inserts/deletes/amends only
+
+# --- sizing / inventory ---
+SOFT_POS_LIMIT = 80               # stop quoting the side that adds inventory beyond this
+BASELINE = 0                      # inventory the skew pulls toward (0 = pure market making) == Sof tpos limit - turn off
+QUOTE_VOL = 5                     # lots per quote???
+MAX_SKEW_TICKS = 5                # centre shift in ticks at the soft limit (PLACEHOLDER)
+SKEW_BETA = 2.0                   # tanh steepness (PLACEHOLDER)
+
+# --- spread model ---
+HALF_SPREAD_MULT = 1.0            # our base half spread = this x measured market half spread
+MIN_HALF_TICKS = 1.5              # floor on our half width, in ticks
+VOL_MULT = 1.0                    # extra half width per 1 sigma of recent microprice moves
+MAX_DEV_MULT = 4.0                # guard: quotes stay within this x market half spread of micro
+SPREAD_HALFLIFE = 40              # loops, EWMA of the market spread
+VOL_HALFLIFE = 10                 # loops, EWMA of squared microprice changes
+
+# --- depth imbalance (OFF until the logged imb column shows it predicts the next move) ---
+IMB_MAX_TICKS = 0.0               # max centre shift in ticks. 0 = disabled
+IMB_LEVELS = 3                    # how much bids/ask we go down in a bok to assess imbalance
+
+# --- order management ---
+NEAR_TICKS = 3                    # our same-side orders within this many ticks get replaced
+LOOP_HZ = 4
+
+# --- kill switch ---
+STOP_FILE = "STOP"                # create this file in the working directory to stop the bot
+STALE_CANCEL_LOOPS = 8            # loops without good data -> pull this instrument's quotes
+MAX_BAD_LOOPS = 40                # loops without good data -> kill everything (PLACEHOLDER)
+MAX_DRAWDOWN = 1000.0             # kill if PnL falls this far below its peak (PLACEHOLDER)
+MAX_RECONNECTS = 3                # a limit breach disconnects us; don't loop on it forever
+
+EPS = 1e-9                        # float tolerance for price comparisons
+RATE_LIMITED = "rate_limited"     # order() result: nothing done, keep existing quotes
+
+LOG_FILE = f"mm_{datetime.now():%Y%m%d_%H%M%S}.csv"
+LOG_COLUMNS = ["instrument", "mkt_bid", "mkt_ask", "micro", "imb", "sigma", "mkt_half",
+               "bid", "ask", "bid_vol", "ask_vol", "pos", "pnl", "n_orders"]
+
+
+# ============================== HELPERS ==============================
+class RateLimiter:
+    def __init__(self, cap):
+        self.cap = cap
+        self.stamps = deque()
+
+    def ok(self, n=1):
+        """True if n more actions fit under the cap right now."""
+        now = time.time()
+        while self.stamps and now - self.stamps[0] > 1.0:
+            self.stamps.popleft()
+        return len(self.stamps) + n <= self.cap
+
+    def hit(self, n=1):
+        now = time.time()
+        for _ in range(n):
+            self.stamps.append(now)
+
+
+class Ewma:
+    def __init__(self, halflife):
+        self.alpha = 1 - 0.5 ** (1 / halflife)
+        self.value = None
+
+    def update(self, x):
+        if self.value is None:
+            self.value = x
+        else:
+            self.value = (1 - self.alpha) * self.value + self.alpha * x
+        return self.value
+
+
+class Vol:
+    def __init__(self, halflife):
+        self.alpha = 1 - 0.5 ** (1 / halflife)
+        self.var = 0.0
+        self.last = None
+
+    def update(self, price):
+        if self.last is not None:
+            change = price - self.last
+            self.var = (1 - self.alpha) * self.var + self.alpha * change * change
+        self.last = price
+        return self.var ** 0.5
+
+
+def round_price(price, tick):
+    return round(round(price / tick) * tick, 2)
+
+
+def fmt(x):
+    return "" if x is None else str(round(x, 4)) if isinstance(x, float) else str(x)
+
+
+def _raise_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+# ============================== BOT ==============================
+class MarketMaker:
+    def __init__(self):
+        self.ex = Exchange()
+        self.ex.connect()
+        self.limiter = RateLimiter(RATE_CAP)
+        self.vols = defaultdict(lambda: Vol(VOL_HALFLIFE))
+        self.spreads = defaultdict(lambda: Ewma(SPREAD_HALFLIFE))
+        self.ticks = {}                       # instrument_id -> tick size, read from the exchange
+        self.last_pos = {}
+        self.bad_loops = defaultdict(int)
+        self.pnl = None
+        self.pnl_peak = None
+        self.pnl_warned = False
+        self.disconnects = 0
+        self.exporter = Exporter()
+        log.info("Connected to exchange.")
+
+    # ---------------- market data (reads) ----------------
+    def count_read(self):
+        if READS_COUNT_TOWARD_LIMIT:
+            self.limiter.hit()
+
+    def get_book(self, iid):
+        self.count_read()
+        try:
+            book = self.ex.get_last_price_book(iid)
+            if book and book.bids and book.asks:
+                return book
+        except Exception as ex:
+            log.error(f"book fetch failed {iid}: {ex}")
+        return None
+
+    def get_position(self, iid):
+        self.count_read()
+        try:
+            return self.ex.get_positions().get(iid, 0)
+        except Exception as ex:
+            log.error(f"get_positions failed: {ex}")
+            return None
+
+    def outstanding(self, iid):
+        """Resting orders: {order_id: OrderStatus(price, volume, side)} or None on failure."""
+        self.count_read()
+        try:
+            return dict(self.ex.get_outstanding_orders(iid))
+        except Exception as ex:
+            log.error(f"get_outstanding_orders {iid}: {ex}")
+            return None
+
+    def refresh_pnl(self):
+        self.count_read()
+        try:
+            self.pnl = float(self.ex.get_pnl())
+            if self.pnl_peak is None or self.pnl > self.pnl_peak:
+                self.pnl_peak = self.pnl
+        except Exception as ex:
+            self.pnl = None
+            if not self.pnl_warned:
+                log.warning(f"get_pnl failed (drawdown kill disabled while it fails): {ex}")
+                self.pnl_warned = True
+
+    # ---------------- pricing  ----------------
+    @staticmethod
+    def microprice(book):
+        """Size-weighted top of book: leans toward the side with less size."""
+        bid, bid_size = book.bids[0].price, book.bids[0].volume
+        ask, ask_size = book.asks[0].price, book.asks[0].volume
+        total = bid_size + ask_size
+        if total <= 0:
+            return (bid + ask) / 2
+        return (bid * ask_size + ask * bid_size) / total
+
+    @staticmethod
+    def depth_imbalance(book):
+        """(bid depth - ask depth) / total over the top IMB_LEVELS levels, in [-1, 1]."""
+        bid_depth = sum(level.volume for level in book.bids[:IMB_LEVELS])
+        ask_depth = sum(level.volume for level in book.asks[:IMB_LEVELS])
+        total = bid_depth + ask_depth
+        return 0.0 if total <= 0 else (bid_depth - ask_depth) / total
+
+    @staticmethod
+    def inventory_shift(pos, tick):
+        """Price shift of the quote centre in [-1, 1]"""
+        dev = pos - BASELINE
+        room = (SOFT_POS_LIMIT - BASELINE) if dev > 0 else (SOFT_POS_LIMIT + BASELINE)
+        if dev == 0 or room <= 0:
+            return 0.0
+        x = min(abs(dev) / room, 1.0)
+        shape = math.tanh(SKEW_BETA * x) / math.tanh(SKEW_BETA)
+        return math.copysign(MAX_SKEW_TICKS * tick * shape, dev)
+
+    def quote_prices(self, micro, pos, sigma, imb, mkt_half, best_bid, best_ask, tick):
+        half = max(HALF_SPREAD_MULT * mkt_half + VOL_MULT * sigma, MIN_HALF_TICKS * tick)
+        centre = micro + IMB_MAX_TICKS * tick * imb - self.inventory_shift(pos, tick) # look into the roel of imb???-> switch max ticks
+
+        # guard 1: stay in a band around the theoretical price
+        max_dev = max(MAX_DEV_MULT * mkt_half, 2 * tick)
+        low, high = micro - max_dev, micro + max_dev
+        raw_bid = min(max(centre - half, low), high)
+        raw_ask = min(max(centre + half, low), high)
+
+        # ???floor to the integer on ticks - 3.9 ceil 4, 3.1 floor 3
+        bid = round(math.floor(raw_bid / tick + EPS) * tick, 2)
+        ask = round(math.ceil(raw_ask / tick - EPS) * tick, 2)
+
+        # guard 2: never cross the market by accident
+        bid = min(bid, round(best_ask - tick, 2))
+        ask = max(ask, round(best_bid + tick, 2))
+
+        # bid strictly below ask
+        if ask - bid < tick - EPS:
+            ask = round(bid + tick, 2)
+        return bid, ask
+
+    @staticmethod
+    def quote_sizes(pos):
+        """Capping by the distance to the soft limit instead means the
+        position asymptotes to SOFT_POS_LIMIT whatever QUOTE_VOL is, and the
+        POS_LIMIT - SOFT_POS_LIMIT lots of headroom are always there to absorb
+        in-flight fills."""
+        bid_vol = max(0, min(QUOTE_VOL, SOFT_POS_LIMIT - pos)) # positive position influences
+        ask_vol = max(0, min(QUOTE_VOL, SOFT_POS_LIMIT + pos)) # negative position influences
+        return bid_vol, ask_vol
+
+    # ---------------- orders ----------------
+    # orders is this loop's snapshot of resting orders. order() and reconcile() update it
+    # in place, so the second side sees the first side's cancels and inserts.
+
+    def _delete(self, iid, oid, orders):
+        try:
+            resp = self.ex.delete_order(iid, order_id=oid)
+        except Exception as ex:
+            self.limiter.hit()
+            log.warning(f"delete_order {iid} #{oid}: {ex}")
+            return False
+        self.limiter.hit()
+        if not resp.success:
+            # keep it in the snapshot: assume it may still rest (conservative for limits)
+            log.warning(f"delete_order {iid} #{oid} failed: {resp.error_reason}")
+            return False
+        orders.pop(oid, None)
+        return True
+
+    def order(self, iid, side, price, vol, pos, orders, tick):
+        """Put one quote on `side`. Returns the order_id that should stay resting, None (no
+        quote wanted / possible), or RATE_LIMITED (nothing touched)."""
+        vol = int(vol)
+        if vol <= 0:
+            return None
+        price = round_price(price, tick)
+
+        same_side = {oid: o for oid, o in orders.items() if o.side == side}
+        for oid, o in same_side.items():
+            if abs(o.price - price) < EPS and o.volume == vol:
+                return oid  # identical quote already resting: no requests, keeps queue spot
+
+        near = [oid for oid, o in same_side.items() if abs(o.price - price) <= NEAR_TICKS * tick + EPS]
+        if not self.limiter.ok(len(near) + 1):  # all-or-nothing: never cancel without budget to re-insert
+            return RATE_LIMITED
+        for oid in near:
+            self._delete(iid, oid, orders)
+
+        # ---- limit re-evaluation on what is still resting ----
+        if len(orders) + 1 > MAX_ORDERS_OUT:
+            log.warning(f"{iid}: {len(orders)} orders out, not adding more")
+            return None
+        rest_bids = sum(o.volume for o in orders.values() if o.side == "bid")
+        rest_asks = sum(o.volume for o in orders.values() if o.side == "ask")
+        if side == "bid":
+            room = POS_LIMIT - (pos + rest_bids)    # worst case: every bid fills
+            best_opp = min((o.price for o in orders.values() if o.side == "ask"), default=None)
+            crosses = best_opp is not None and price >= best_opp - EPS
+        else:
+            room = POS_LIMIT + (pos - rest_asks)    # worst case: every ask fills
+            best_opp = max((o.price for o in orders.values() if o.side == "bid"), default=None)
+            crosses = best_opp is not None and price <= best_opp + EPS
+        vol = min(vol, room)
+        if vol <= 0:
+            log.info(f"{iid} {side}: no room (pos={pos}, resting bids={rest_bids} asks={rest_asks})")
+            return None
+        if crosses:
+            log.info(f"{iid} {side} @{price} would hit our own {best_opp}, skipped")
+            return None
+
+        try:
+            resp = self.ex.insert_order(iid, price=price, volume=vol, side=side, order_type="limit")
+        except Exception as ex:
+            self.limiter.hit()
+            log.error(f"insert_order {iid}: {ex}")
+            return None
+        self.limiter.hit()
+        if not resp.success:
+            log.warning(f"insert {iid} {side} {vol}@{price} rejected: {resp.error_reason}")
+            return None
+        orders[resp.order_id] = SimpleNamespace(price=price, volume=vol, side=side)
+        return resp.order_id
+
+    def reconcile(self, iid, side, keep, orders):
+        """Cancel every same-side order, keep=None -> we want no quote on this side, so cancel all of them."""
+        for oid in [oid for oid, o in orders.items() if o.side == side and oid != keep]:
+            if not self.limiter.ok():
+                log.warning(f"{iid} {side}: rate budget hit, stale #{oid} left for next loop")
+                return
+            self._delete(iid, oid, orders)
+
+    def cancel_all(self, iid, attempts=3):
+        """Fail-closed cancel. Deliberately ignores the rate limiter: pulling quotes always wins."""
+        for _ in range(attempts):
+            try:
+                self.ex.delete_orders(iid)
+                return True
+            except Exception as ex:
+                log.warning(f"cancel_all {iid}: {ex}")
+                time.sleep(0.2)
+        return False
+
+    # ---------------- one loop iteration ----------------
+    def step(self, iid):
+        book = self.get_book(iid)
+        pos = self.get_position(iid)
+        orders = self.outstanding(iid)
+        if book is None or pos is None or orders is None:
+            return False
+        tick = self.ticks[iid]
+
+        best_bid, best_ask = book.bids[0].price, book.asks[0].price
+        micro = self.microprice(book)
+        imb = self.depth_imbalance(book)
+        sigma = self.vols[iid].update(micro)                       # the ONLY place vol advances
+        mkt_half = self.spreads[iid].update((best_ask - best_bid) / 2)
+
+        prev = self.last_pos.get(iid)
+        if prev is not None and pos != prev:
+            log.info(f"{iid} FILL: position {prev} -> {pos} (micro {micro:.3f})")
+        self.last_pos[iid] = pos
+
+        bid, ask = self.quote_prices(micro, pos, sigma, imb, mkt_half, best_bid, best_ask, tick)
+        bid_vol, ask_vol = self.quote_sizes(pos)
+
+        for side, price, vol in (("bid", bid, bid_vol), ("ask", ask, ask_vol)):
+            keep = self.order(iid, side, price, vol, pos, orders, tick)
+            if keep is not RATE_LIMITED:
+                self.reconcile(iid, side, keep, orders)
+
+        self.write_row([iid, best_bid, best_ask, micro, imb, sigma, mkt_half,
+                        bid, ask, bid_vol, ask_vol, pos, self.pnl, len(orders)])
+        return True
+
+    def write_row(self, values):
+        """Logging must never take the bot down."""
+        try:
+            self.exporter.export({LOG_FILE: [[fmt(v) for v in values]]})
+        except Exception as ex:
+            log.warning(f"csv log failed: {ex}")
+
+    # ---------------- lifecycle ----------------
+    def preflight(self, iids):
+        tradable = self.ex.get_tradable_instruments()
+        for iid in iids:
+            if iid not in tradable:
+                raise ValueError(f"{iid} not tradable. Available: {sorted(tradable)}")
+            inst = tradable[iid]
+            self.ticks[iid] = inst.tick_size
+            log.info(f"{iid}: tick={inst.tick_size} type={getattr(inst, 'instrument_type', None)} "
+                     f"price_change_limit={getattr(inst, 'price_change_limit', None)}")
+        if os.path.exists(STOP_FILE):
+            os.remove(STOP_FILE)
+            log.info(f"removed leftover {STOP_FILE} file")
+        for iid in iids:
+            self.cancel_all(iid)  # clean slate: no leftovers from a previous run
+        self.write_row(LOG_COLUMNS)  # header (Exporter puts a timestamp in column 1)
+        log.info(f"Logging to exports/{LOG_FILE}")
+
+    def kill_reason(self):
+        if os.path.exists(STOP_FILE):
+            return f"{STOP_FILE} file present"
+        for iid, count in self.bad_loops.items():
+            if count >= MAX_BAD_LOOPS:
+                return f"{iid}: no usable data for {count} loops"
+        for iid, pos in self.last_pos.items():
+            if abs(pos) > POS_LIMIT:
+                return f"{iid}: |position| {pos} above limit {POS_LIMIT}"
+        if self.pnl is not None and self.pnl_peak is not None:
+            if self.pnl_peak - self.pnl > MAX_DRAWDOWN:
+                return f"drawdown {self.pnl_peak - self.pnl:.1f} above {MAX_DRAWDOWN}"
+        return None
+
+    def try_reconnect(self, attempts=3):
+        for i in range(attempts):
+            try:
+                self.ex.connect()
+                if self.ex.is_connected():
+                    log.warning("Reconnected.")
+                    return True
+            except Exception as ex:
+                log.error(f"reconnect {i + 1}/{attempts} failed: {ex}")
+            time.sleep(1.0)
+        return False
+
+    def shutdown(self, iids):
+        """Always runs. Cancels everything, verifies, reports, disconnects."""
+        log.info("Shutting down: cancelling all orders.")
+        for iid in iids:
+            self.cancel_all(iid)
+        for iid in iids:
+            left = self.outstanding(iid)
+            if left is None:
+                log.error(f"{iid}: could not verify that no orders are resting")
+            elif left:
+                log.error(f"{iid}: {len(left)} orders still resting, deleting one by one")
+                for oid in left:
+                    try:
+                        self.ex.delete_order(iid, order_id=oid)
+                    except Exception as ex:
+                        log.error(f"delete_order {iid} #{oid}: {ex}")
+            else:
+                log.info(f"{iid}: no resting orders.")
+        try:
+            log.info(f"Final positions: {self.ex.get_positions()}  PnL: {self.ex.get_pnl()}")
+        except Exception as ex:
+            log.warning(f"final report failed: {ex}")
+        try:
+            self.ex.disconnect()  # only one connection per username: free it for the next run
+        except Exception as ex:
+            log.warning(f"disconnect: {ex}")
+
+    def run(self, iids):
+        dt = 1.0 / LOOP_HZ
+        try:
+            self.preflight(iids)
+            while True:
+                t0 = time.time()
+                reason = self.kill_reason()
+                if reason:
+                    log.error(f"KILL SWITCH: {reason}")
+                    break
+                if not self.ex.is_connected():
+                    # The guide: breaching a limit rejects the order AND disconnects us.
+                    # Reconnecting in a loop would just hide that, so cap the retries.
+                    self.disconnects += 1
+                    if self.disconnects > MAX_RECONNECTS:
+                        log.error(f"KILL SWITCH: disconnected {self.disconnects}x "
+                                  f"(limit breach? read the log above)")
+                        break
+                    if not self.try_reconnect():
+                        log.error("KILL SWITCH: disconnected and reconnect failed")
+                        break
+                self.refresh_pnl()
+                for iid in iids:
+                    ok = False
+                    try:
+                        ok = self.step(iid)
+                    except Exception as ex:
+                        log.error(f"step {iid}: {ex}")
+                    self.bad_loops[iid] = 0 if ok else self.bad_loops[iid] + 1
+                    if self.bad_loops[iid] == STALE_CANCEL_LOOPS:
+                        log.warning(f"{iid}: no usable data for {STALE_CANCEL_LOOPS} loops, pulling quotes")
+                        self.cancel_all(iid)
+                time.sleep(max(0.0, dt - (time.time() - t0)))
+        finally:
+            self.shutdown(iids)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _raise_interrupt)
+    MarketMaker().run(INSTRUMENTS)
