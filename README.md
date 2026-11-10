@@ -1,7 +1,7 @@
 # ETH-MiniHack-Nov26 by Optiver
 
 # Background
-On Friday 6th November, I had an opportunity to visit the Mini Hackathon by Optiver & ETH Entrepreneurship Club in Zurich. Before the event, I have spent the week doing my best to understand the basics of the market-making and in this repository I would like to elaborate on my challenges during the event, while not directly giving any hints to ensure the fair competition for the next hackathons.
+On Friday 6th November, I had an opportunity to visit the Mini Hackathon by Optiver & ETH Entrepreneurship Club in Zurich. Before the event, I have spent the week doing my best to understand the basics of the market-making and in this repository I would like to elaborate on my experience during the event, while not directly giving any hints to ensure the fair competition for the next hackathons.
 
 # Challenge Structure
 The hackathon took place for around 5 hours of testing time and one final evaluation round, during which the winner was estimated. During the preparation round, we were testing dfferent stratagies and ideas. We were trading a universe of 6 Tech stocks (no options, etfs or futures), although it is not the fundamentals that mattered behind (as prices were not a representation of a real market price), but the patterns and behaviour of other participants. The teams of 3-4 members were formed and given access to a cloud kernel to run the research and ideas using Optibook. (You can find any further information online, as I did before the competition, difference is, every challenge differes in its structure and limitations)
@@ -17,10 +17,14 @@ $$P_{Ask} = MP + OI - INVST + 1/2(HF+VA)$$
 
 where: MP - Micro Price, OI - Order Book Imbalance, INVST - Inventory Shift (tanh limit [-1,1]), HF - Half Spread, VA - Volatility Adjustment. For simplicity I have left out all the limits and specific formulas you can find them in: [template version](https://github.com/mathio3434/ETH-MiniHack-Nov26/blob/main/template). Additionally, the model carries a robust, conservative infrastructure for order handling, by ensuring to hold all the limits, clean outstanding orders, shall the other user connect, manual hand break option and clear order management. One of the pronounced tradeoffs is that if additional orders are possible, the order is first deleted before the new one is inserted. Shall we break on exchange call limits, it can result into the price/time slippage. However, the code ensures the order placing up to the wished magnitude, conditional on outstanding free limits incl. possible fill of all orders. Since the infrastructure is rather general (except for limits) I do not see any comparative advantage of the model, unless calibrated for the specific markets, leaving it a central role of being educative.
 
+**Final model**
+In the final 2 hours of the competition, we could finally get our hands on the data, of the idea we have thought might be our edge. The core that we found was lagged relationship between variables. In other words, we found that that Universe of 3 assets (A,B,C,D) exhibits the following relationship:
+1. *A* holds a constant price relationship to *B* over time. Shall the ratio deviate, it statistically corrects during next 30s Bar. In that regard, shall the price of one asset change its value, we would revise $Expected Price_{A} = New Price_{B} / Ratio$. Shall the current price deviate, we have thought about 2 possible strategies: (Assume current price is lower than the expected by 500 ticks)
+   a. Aggressive: buy the asks up to x ticks difference from 500, anticipating the jump. This strategy is about market taking and that what we decided to do: our environment was driven by sharp P&L jumps, so to survive we had to take agression.
+   b. Passive: a market making one would say just shift your quotes to adjust to fair price. We would like to have higher bids to be filled cheap on the price. This is a conservative view worked stale in the trading environment that we had.
+2. *C* would have a 0.96 correlation with *D*, though the co-movement magnitude *beta* is 0.6. Meaning 1% move of C should be on average 0.6% move of D. Practically the 60% of gap difference closed at about 20s. We decided to move with a strategy that establishes the next 20s reservation price based on the relationship and we take the quotes into the price side - x limit (if higher - buy out asks), but only so far that we have a fair position & competitive quotes centered around that price.
 
-
-
-
+I would like to comment, that this was a conceptual idea, that did not work out in the environment it was applied. Maybe that's a great example of resulting: we thought we have a good hand, that turned out badly (rephrased Annie Duke) or maybe, we have overfitted our signal to distorted market environment, since this relationship could be a byproduct of poor quoting model of the other participants that some could capture and we did not: trading the crumbs, while other guys took the pie. 
 
 # Lessons learned from the challenge
 1. **Figure out how the system works** - sounds very plain, but in fact, it is what took us great 30 mins, which is a significant time. Problem was that although the environment was in a cloud and all team members had an access, it was always only one person running a bot or a history or a test. This was crucial for the next point.
